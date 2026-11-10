@@ -78,11 +78,24 @@ def fetch_with_playwright(url: str) -> Optional[int]:
 
             # 3. Wakefit Official & Generic e-commerce JSON-LD schemas
             elif "wakefit" in domain:
-                for sel in [".special-price", ".selling-price", ".final-price", "[data-price]", "span.price", ".product-price"]:
+                # Try clicking Queen / 6 inch variant options if present
+                try:
+                    for label in ["Queen", "78 x 60", "78x60", "6 inch", "6 Inch"]:
+                        btn = page.query_selector(f"button:has-text('{label}'), div:has-text('{label}'), span:has-text('{label}')")
+                        if btn:
+                            try:
+                                btn.click(timeout=2000)
+                                page.wait_for_timeout(1000)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                for sel in [".special-price", ".selling-price", ".final-price", "[data-price]", "span.price", ".product-price", "[class*='price']"]:
                     el = page.query_selector(sel)
                     if el:
                         cleaned = re.sub(r"[^\d]", "", el.inner_text())
-                        if cleaned and int(cleaned) > 500:
+                        if cleaned and 5000 <= int(cleaned) <= 30000:
                             price = int(cleaned)
                             break
 
@@ -324,9 +337,13 @@ def check_product(item: Dict[str, Any]) -> Dict[str, Any]:
             print(f"  -> {s_name}: {currency} {price:,}")
             store_results.append({"store": s_name, "url": s_url, "price": price})
         else:
-            print(f"  -> {s_name}: Price not found")
+            print(f"  -> {s_name}: Price not detected (dynamic / configurator page)")
+            store_results.append({"store": s_name, "url": s_url, "price": None})
 
-    if not store_results:
+    priced = [s for s in store_results if s["price"] is not None]
+    unpriced = [s for s in store_results if s["price"] is None]
+
+    if not priced:
         return {
             "name": name,
             "threshold": threshold,
@@ -334,13 +351,13 @@ def check_product(item: Dict[str, Any]) -> Dict[str, Any]:
             "lowest_price": None,
             "lowest_store": None,
             "lowest_url": None,
-            "all_stores": [],
+            "all_stores": store_results,
             "status": "⚠️ Failed to fetch"
         }
 
-    # Sort stores by price to find the absolute lowest deal
-    store_results.sort(key=lambda x: x["price"])
-    best = store_results[0]
+    # Sort priced stores by price to find the absolute lowest deal
+    priced.sort(key=lambda x: x["price"])
+    best = priced[0]
     is_below = best["price"] <= threshold
 
     return {
@@ -350,7 +367,7 @@ def check_product(item: Dict[str, Any]) -> Dict[str, Any]:
         "lowest_price": best["price"],
         "lowest_store": best["store"],
         "lowest_url": best["url"],
-        "all_stores": store_results,
+        "all_stores": priced + unpriced,
         "status": "✅ Price Below Threshold!" if is_below else "⏳ Above Threshold"
     }
 
@@ -418,17 +435,25 @@ def main():
                 comparison_plain_lines = []
 
                 for idx, s in enumerate(res["all_stores"]):
-                    medal = medals[idx] if idx < len(medals) else "•"
-                    diff = s["price"] - lowest
-                    diff_text = f" (+{currency} {diff:,})" if diff > 0 else " <i>(Lowest!)</i>"
-                    diff_plain = f" (+{currency} {diff:,})" if diff > 0 else " (Lowest!)"
+                    if s["price"] is not None:
+                        medal = medals[idx] if idx < len(medals) else "•"
+                        diff = s["price"] - lowest
+                        diff_text = f" (+{currency} {diff:,})" if diff > 0 else " <i>(Lowest!)</i>"
+                        diff_plain = f" (+{currency} {diff:,})" if diff > 0 else " (Lowest!)"
 
-                    comparison_html_lines.append(
-                        f"{medal} <b>{s['store']}</b>: {currency} {s['price']:,}{diff_text} • <a href=\"{s['url']}\">View</a>"
-                    )
-                    comparison_plain_lines.append(
-                        f"{medal} {s['store']}: {currency} {s['price']:,}{diff_plain} - {s['url']}"
-                    )
+                        comparison_html_lines.append(
+                            f"{medal} <b>{s['store']}</b>: {currency} {s['price']:,}{diff_text} • <a href=\"{s['url']}\">View</a>"
+                        )
+                        comparison_plain_lines.append(
+                            f"{medal} {s['store']}: {currency} {s['price']:,}{diff_plain} - {s['url']}"
+                        )
+                    else:
+                        comparison_html_lines.append(
+                            f"• <b>{s['store']}</b>: <i>Configurator Page</i> • <a href=\"{s['url']}\">View</a>"
+                        )
+                        comparison_plain_lines.append(
+                            f"• {s['store']}: Configurator Page - {s['url']}"
+                        )
 
                 comparison_html_text = "\n".join(comparison_html_lines)
                 comparison_plain_text = "\n".join(comparison_plain_lines)
