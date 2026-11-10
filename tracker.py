@@ -76,15 +76,42 @@ def fetch_with_playwright(url: str) -> Optional[int]:
                             price = int(cleaned)
                             break
 
-            # 3. Wakefit Official
+            # 3. Wakefit Official & Generic e-commerce JSON-LD schemas
             elif "wakefit" in domain:
-                for sel in [".special-price", ".selling-price", ".final-price", "[data-price]", "span.price"]:
+                for sel in [".special-price", ".selling-price", ".final-price", "[data-price]", "span.price", ".product-price"]:
                     el = page.query_selector(sel)
                     if el:
                         cleaned = re.sub(r"[^\d]", "", el.inner_text())
                         if cleaned and int(cleaned) > 500:
                             price = int(cleaned)
                             break
+
+            # 4. Universal JSON-LD Schema Extraction (used by Wakefit, Flipkart, etc. for SEO)
+            if not price:
+                try:
+                    for s in page.query_selector_all('script[type="application/ld+json"]'):
+                        try:
+                            data = json.loads(s.inner_text())
+                            items = data if isinstance(data, list) else [data]
+                            for it in items:
+                                offers = it.get("offers", {})
+                                if isinstance(offers, dict):
+                                    val = offers.get("price") or offers.get("lowPrice")
+                                    if val and float(val) > 100:
+                                        price = int(float(val))
+                                        break
+                                elif isinstance(offers, list):
+                                    for o in offers:
+                                        val = o.get("price") or o.get("lowPrice")
+                                        if val and float(val) > 100:
+                                            price = int(float(val))
+                                            break
+                        except Exception:
+                            continue
+                        if price:
+                            break
+                except Exception:
+                    pass
 
             # 4. Fallback: Parse rendered HTML
             if not price:
@@ -383,32 +410,53 @@ def main():
 
             if lowest <= threshold:
                 savings = threshold - lowest
-                savings_str = f" (Savings: {currency} {savings:,})" if savings > 0 else ""
+                savings_str = f" <i>(Saved {currency} {savings:,} below target)</i>" if savings > 0 else ""
+                savings_plain = f" (Saved {currency} {savings:,} below target)" if savings > 0 else ""
 
-                comparison_lines = []
-                for s in res["all_stores"]:
-                    marker = "🏆 " if s["store"] == lowest_store else "   "
-                    comparison_lines.append(f"{marker}• {s['store']}: {currency} {s['price']:,}")
-                comparison_text = "\n".join(comparison_lines)
+                medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣"]
+                comparison_html_lines = []
+                comparison_plain_lines = []
+
+                for idx, s in enumerate(res["all_stores"]):
+                    medal = medals[idx] if idx < len(medals) else "•"
+                    diff = s["price"] - lowest
+                    diff_text = f" (+{currency} {diff:,})" if diff > 0 else " <i>(Lowest!)</i>"
+                    diff_plain = f" (+{currency} {diff:,})" if diff > 0 else " (Lowest!)"
+
+                    comparison_html_lines.append(
+                        f"{medal} <b>{s['store']}</b>: {currency} {s['price']:,}{diff_text} • <a href=\"{s['url']}\">View</a>"
+                    )
+                    comparison_plain_lines.append(
+                        f"{medal} {s['store']}: {currency} {s['price']:,}{diff_plain} - {s['url']}"
+                    )
+
+                comparison_html_text = "\n".join(comparison_html_lines)
+                comparison_plain_text = "\n".join(comparison_plain_lines)
 
                 tg_html_msg = (
                     f"🚨 <b>PRICE DROP ALERT!</b>\n\n"
-                    f"<b>{name}</b> is now at the lowest price!\n\n"
-                    f"🏆 <b>Lowest Store:</b> {lowest_store}\n"
-                    f"💰 <b>Current Price:</b> {currency} {lowest:,}{savings_str}\n"
-                    f"🎯 <b>Target Threshold:</b> {currency} {threshold:,}\n\n"
-                    f"📊 <b>Cross-Site Comparison:</b>\n{comparison_text}\n\n"
-                    f"👉 <a href=\"{lowest_url}\">Click Here to Buy on {lowest_store}</a>"
+                    f"<b>{name}</b>\n\n"
+                    f"🏆 <b>BEST DEAL: {lowest_store}</b>\n"
+                    f"💰 <b>Lowest Price:</b> {currency} {lowest:,}{savings_str}\n"
+                    f"🎯 <b>Target Limit:</b> {currency} {threshold:,}\n"
+                    f"👉 <a href=\"{lowest_url}\"><b>Buy Now on {lowest_store} ➔</b></a>\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 <b>ALL STORES COMPARED:</b>\n\n"
+                    f"{comparison_html_text}\n"
+                    f"━━━━━━━━━━━━━━━━━━━"
                 )
 
                 tg_plain_msg = (
                     f"🚨 PRICE DROP ALERT!\n\n"
-                    f"{name} is now at the lowest price!\n\n"
-                    f"Lowest Store: {lowest_store}\n"
-                    f"Current Price: {currency} {lowest:,}{savings_str}\n"
-                    f"Target Threshold: {currency} {threshold:,}\n\n"
-                    f"Cross-Site Comparison:\n{comparison_text}\n\n"
-                    f"Buy link: {lowest_url}"
+                    f"{name}\n\n"
+                    f"🏆 BEST DEAL: {lowest_store}\n"
+                    f"💰 Lowest Price: {currency} {lowest:,}{savings_plain}\n"
+                    f"🎯 Target Limit: {currency} {threshold:,}\n"
+                    f"Buy Now: {lowest_url}\n\n"
+                    f"-----------------------------\n"
+                    f"ALL STORES COMPARED:\n\n"
+                    f"{comparison_plain_text}\n"
+                    f"-----------------------------"
                 )
 
                 print(">>> ALERT CONDITION MET! Dispatching notifications...")
