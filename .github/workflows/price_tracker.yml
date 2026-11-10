@@ -1,0 +1,40 @@
+name: 24/7 Price Drop Tracker
+
+on:
+  schedule:
+    # Runs at the top of every hour (24/7 in the cloud for free)
+    - cron: '0 * * * *'
+  workflow_dispatch: # Allows manual trigger from the GitHub web UI anytime
+
+jobs:
+  track-prices:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Needed to save updated history.json back to repo
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Price Drop Tracker
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          python tracker.py
+
+      - name: Commit and push updated price history
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add history.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: update price history [skip ci]" && git push)

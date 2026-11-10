@@ -1,0 +1,17 @@
+{
+  "notifications": {
+    "macos_banner": true,
+    "email": "hrithik356hrithik@gmail.com"
+  },
+  "products": [
+    {
+      "name": "Wakefit Orthopaedic Memory Foam Mattress 6-Inch (Queen 78x60)",
+      "reference_url": "https://www.amazon.in/Wakefit-Orthopaedic-Memory-Mattress-6inch/dp/B00RAEVRZQ?th=1",
+      "threshold_price": 8400,
+      "currency": "INR",
+      "last_known_lowest_price": 9896,
+      "last_known_lowest_source": "Wakefit Official (with promotional discount) / Amazon India (₹10,400)",
+      "last_checked_at": "2026-11-10T14:20:00+05:30"
+    }
+  ]
+}
