@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-24/7 Automated Price Drop Tracker
-Monitors product prices and triggers alerts when prices drop below defined thresholds.
-Runs locally or on GitHub Actions (100% free).
+24/7 Automated Multi-Site Price Drop Tracker
+Monitors product prices across different websites, identifies the lowest deal,
+and sends instant alerts when prices drop below the target threshold.
+Runs locally or on GitHub Actions (100% free 24/7).
 """
 
 import json
@@ -13,9 +14,11 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
+import urllib.error
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from typing import Optional, Dict, Any, List
 
 
 USER_AGENT = (
@@ -25,7 +28,9 @@ USER_AGENT = (
 
 
 def fetch_html(url: str) -> str:
-    """Fetches web page HTML using curl with realistic headers."""
+    """Fetches web page HTML using curl with realistic browser headers."""
+    if not url:
+        return ""
     cmd = [
         "curl", "-s", "-L",
         "-A", USER_AGENT,
@@ -41,8 +46,6 @@ def fetch_html(url: str) -> str:
         print(f"Error fetching {url}: {e}", file=sys.stderr)
         return ""
 
-
-from typing import Optional
 
 def extract_price(url: str, html: str) -> Optional[int]:
     """Extracts selling price from e-commerce page HTML."""
@@ -87,6 +90,58 @@ def extract_price(url: str, html: str) -> Optional[int]:
     return None
 
 
+def send_telegram_alert(bot_token: str, chat_id: str, message: str, plain_text_fallback: str):
+    """Sends a Telegram push notification with full error diagnostics and fallback."""
+    print(f"\n[Telegram] Attempting to send alert to Chat ID: {chat_id}...")
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+
+    # Try HTML mode first with strict double-quotes
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            print("✅ [Telegram] Alert delivered successfully!")
+            return
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode("utf-8", errors="ignore")
+        print(f"⚠️ [Telegram] HTML delivery failed ({e.code}): {err_msg}", file=sys.stderr)
+        print("[Telegram] Retrying with plain-text fallback...", file=sys.stderr)
+
+        # Retry with plain text to bypass HTML parsing errors
+        plain_payload = {
+            "chat_id": chat_id,
+            "text": plain_text_fallback,
+            "disable_web_page_preview": False
+        }
+        plain_req = urllib.request.Request(
+            url,
+            data=json.dumps(plain_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(plain_req, timeout=15) as resp:
+                print("✅ [Telegram] Plain text alert delivered successfully!")
+                return
+        except urllib.error.HTTPError as e2:
+            err2 = e2.read().decode("utf-8", errors="ignore")
+            print(f"❌ [Telegram] Plain text retry failed ({e2.code}): {err2}", file=sys.stderr)
+            if "bot was blocked" in err2 or "chat not found" in err2:
+                print("💡 TIP: Please open your bot in Telegram and press 'Start' so it is allowed to message you!", file=sys.stderr)
+    except Exception as e:
+        print(f"❌ [Telegram] Unexpected error: {e}", file=sys.stderr)
+
+
 def send_discord_alert(webhook_url: str, title: str, message: str, product_url: str):
     """Sends a rich Discord embed notification."""
     payload = {
@@ -107,34 +162,13 @@ def send_discord_alert(webhook_url: str, title: str, message: str, product_url: 
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            print("Discord alert sent successfully!")
+            print("✅ [Discord] Alert delivered successfully!")
     except Exception as e:
-        print(f"Failed to send Discord alert: {e}", file=sys.stderr)
-
-
-def send_telegram_alert(bot_token: str, chat_id: str, message: str):
-    """Sends a Telegram push notification."""
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
-    }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            print("Telegram alert sent successfully!")
-    except Exception as e:
-        print(f"Failed to send Telegram alert: {e}", file=sys.stderr)
+        print(f"❌ [Discord] Failed to send alert: {e}", file=sys.stderr)
 
 
 def send_email_alert(smtp_user: str, smtp_pass: str, to_email: str, subject: str, body: str):
-    """Sends an email alert using standard SMTP (e.g. Gmail App Password)."""
+    """Sends an email alert using standard SMTP."""
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = smtp_user
@@ -156,9 +190,62 @@ def send_email_alert(smtp_user: str, smtp_pass: str, to_email: str, subject: str
             server.starttls()
             server.login(smtp_user, smtp_pass)
             server.send_message(msg)
-        print("Email alert sent successfully!")
+        print("✅ [Email] Alert sent successfully!")
     except Exception as e:
-        print(f"Failed to send email alert: {e}", file=sys.stderr)
+        print(f"❌ [Email] Failed to send alert: {e}", file=sys.stderr)
+
+
+def check_product(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Checks prices for a single product across all its configured store links."""
+    name = item.get("name", "Unknown Product")
+    threshold = item.get("threshold_price", 0)
+    currency = item.get("currency", "INR")
+
+    # Support either single 'url' or multiple 'stores'
+    stores_list = item.get("stores", [])
+    if not stores_list and item.get("url"):
+        stores_list = [{"store": "Amazon India", "url": item.get("url")}]
+
+    store_results = []
+    for s in stores_list:
+        s_name = s.get("store", "Store")
+        s_url = s.get("url", "")
+        print(f"Fetching from {s_name}...")
+        html = fetch_html(s_url)
+        price = extract_price(s_url, html)
+        if price:
+            print(f"  -> {s_name}: {currency} {price:,}")
+            store_results.append({"store": s_name, "url": s_url, "price": price})
+        else:
+            print(f"  -> {s_name}: Price not found")
+
+    if not store_results:
+        return {
+            "name": name,
+            "threshold": threshold,
+            "currency": currency,
+            "lowest_price": None,
+            "lowest_store": None,
+            "lowest_url": None,
+            "all_stores": [],
+            "status": "⚠️ Failed to fetch"
+        }
+
+    # Find the store with the lowest price
+    store_results.sort(key=lambda x: x["price"])
+    best = store_results[0]
+    is_below = best["price"] <= threshold
+
+    return {
+        "name": name,
+        "threshold": threshold,
+        "currency": currency,
+        "lowest_price": best["price"],
+        "lowest_store": best["store"],
+        "lowest_url": best["url"],
+        "all_stores": store_results,
+        "status": "✅ Price Below Threshold!" if is_below else "⏳ Above Threshold"
+    }
 
 
 def main():
@@ -173,6 +260,23 @@ def main():
     with open(products_file, "r") as f:
         products = json.load(f)
 
+    # Check secrets availability
+    tg_token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    tg_chat_id = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    discord_webhook = (os.getenv("DISCORD_WEBHOOK_URL") or "").strip()
+    email_user = (os.getenv("EMAIL_USER") or "").strip()
+    email_pass = (os.getenv("EMAIL_PASS") or "").strip()
+    email_to = (os.getenv("EMAIL_TO") or email_user).strip()
+
+    print("=" * 50)
+    print("🔔 Notification Configuration:")
+    print(f"  Telegram Bot Token: {'Configured ✅' if tg_token else 'NOT SET ❌'}")
+    print(f"  Telegram Chat ID:   {'Configured ✅ (' + tg_chat_id + ')' if tg_chat_id else 'NOT SET ❌'}")
+    print(f"  Discord Webhook:    {'Configured ✅' if discord_webhook else 'NOT SET'}")
+    print(f"  Email Alerts:       {'Configured ✅' if email_user and email_pass else 'NOT SET'}")
+    print("=" * 50)
+
+    summary_rows = []
     history = {}
     if os.path.exists(history_file):
         try:
@@ -181,90 +285,102 @@ def main():
         except Exception:
             history = {}
 
-    discord_webhook = os.getenv("DISCORD_WEBHOOK_URL")
-    tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    tg_chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    email_user = os.getenv("EMAIL_USER")
-    email_pass = os.getenv("EMAIL_PASS")
-    email_to = os.getenv("EMAIL_TO") or email_user
-
-    summary_rows = []
-    print(f"Checking {len(products)} product(s)...")
+    print(f"\nChecking {len(products)} product(s)...")
 
     for item in products:
-        name = item.get("name", "Unknown Product")
-        url = item.get("url", "")
-        threshold = item.get("threshold_price", 0)
-        currency = item.get("currency", "INR")
-
+        name = item.get("name", "Product")
         print(f"\n--- Checking: {name} ---")
-        html = fetch_html(url)
-        current_price = extract_price(url, html)
+        res = check_product(item)
 
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        threshold = res["threshold"]
+        currency = res["currency"]
+        lowest = res["lowest_price"]
+        lowest_store = res["lowest_store"]
+        lowest_url = res["lowest_url"]
 
-        if current_price:
-            print(f"Current Price: {currency} {current_price:,} | Threshold: {currency} {threshold:,}")
-            status = "✅ Price Below Threshold!" if current_price <= threshold else "⏳ Above Threshold"
-            summary_rows.append(f"| {name} | {currency} {current_price:,} | {currency} {threshold:,} | {status} |")
+        if lowest:
+            print(f"🏆 Lowest: {currency} {lowest:,} on {lowest_store} | Target: {currency} {threshold:,}")
+            summary_rows.append(f"| {name} | **{currency} {lowest:,}** ({lowest_store}) | {currency} {threshold:,} | {res['status']} |")
 
-            # Check if alert condition met
-            if current_price <= threshold:
-                alert_title = f"Price Drop Alert: {name}"
-                savings = threshold - current_price
-                savings_text = f" (Savings: {currency} {savings:,})" if savings > 0 else ""
-                
-                alert_text = (
-                    f"<b>{name}</b> is now available for <b>{currency} {current_price:,}</b>!{savings_text}\n"
-                    f"Target Threshold: {currency} {threshold:,}\n\n"
-                    f"👉 <a href='{url}'>Click Here to Buy Now</a>"
+            if lowest <= threshold:
+                savings = threshold - lowest
+                savings_str = f" (Savings: {currency} {savings:,})" if savings > 0 else ""
+
+                # Cross-site comparison summary
+                comparison_lines = []
+                for s in res["all_stores"]:
+                    marker = "🏆 " if s["store"] == lowest_store else "   "
+                    comparison_lines.append(f"{marker}• {s['store']}: {currency} {s['price']:,}")
+                comparison_text = "\n".join(comparison_lines)
+
+                # HTML message for Telegram
+                tg_html_msg = (
+                    f"🚨 <b>PRICE DROP ALERT!</b>\n\n"
+                    f"<b>{name}</b> is now at the lowest price!\n\n"
+                    f"🏆 <b>Lowest Store:</b> {lowest_store}\n"
+                    f"💰 <b>Current Price:</b> {currency} {lowest:,}{savings_str}\n"
+                    f"🎯 <b>Target Threshold:</b> {currency} {threshold:,}\n\n"
+                    f"📊 <b>Cross-Site Comparison:</b>\n{comparison_text}\n\n"
+                    f"👉 <a href=\"{lowest_url}\">Click Here to Buy on {lowest_store}</a>"
                 )
 
-                print(">>> ALERT TRIGGERED! Sending notifications...")
+                # Plain text message fallback
+                tg_plain_msg = (
+                    f"🚨 PRICE DROP ALERT!\n\n"
+                    f"{name} is now at the lowest price!\n\n"
+                    f"Lowest Store: {lowest_store}\n"
+                    f"Current Price: {currency} {lowest:,}{savings_str}\n"
+                    f"Target Threshold: {currency} {threshold:,}\n\n"
+                    f"Cross-Site Comparison:\n{comparison_text}\n\n"
+                    f"Buy link: {lowest_url}"
+                )
 
-                # 1. Discord
-                if discord_webhook:
-                    send_discord_alert(discord_webhook, alert_title, alert_text, url)
+                print(">>> ALERT CONDITION MET! Dispatching notifications...")
 
-                # 2. Telegram
+                # 1. Telegram
                 if tg_token and tg_chat_id:
-                    send_telegram_alert(tg_token, tg_chat_id, alert_text)
+                    send_telegram_alert(tg_token, tg_chat_id, tg_html_msg, tg_plain_msg)
+                else:
+                    print("⚠️ Telegram alert skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing.")
+
+                # 2. Discord
+                if discord_webhook:
+                    send_discord_alert(discord_webhook, f"Price Drop: {name}", tg_plain_msg, lowest_url)
 
                 # 3. Email
                 if email_user and email_pass and email_to:
-                    send_email_alert(email_user, email_pass, email_to, alert_title, alert_text)
+                    send_email_alert(email_user, email_pass, email_to, f"Price Drop: {name}", tg_plain_msg)
 
-                # 4. Local macOS notification (if running on Mac)
+                # 4. macOS Notification (if local)
                 if sys.platform == "darwin":
-                    msg = f"Now {currency} {current_price:,} (below threshold {currency} {threshold:,})"
+                    msg = f"Lowest: {currency} {lowest:,} on {lowest_store}!"
                     subprocess.run([
                         "osascript", "-e",
-                        f'display notification "{msg}" with title "Price Drop: {name}" sound name "Glass"'
+                        f'display notification "{msg}" with title "Price Drop Alert" sound name "Glass"'
                     ], check=False)
 
-            # Update history
-            history[url] = {
-                "name": name,
-                "last_price": current_price,
+            # Update history record
+            history[name] = {
+                "lowest_price": lowest,
+                "lowest_store": lowest_store,
+                "lowest_url": lowest_url,
                 "threshold": threshold,
                 "currency": currency,
-                "last_checked": timestamp
+                "last_checked": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
         else:
-            print("Could not extract price (page structure may have changed or blocked).")
             summary_rows.append(f"| {name} | Unknown | {currency} {threshold:,} | ⚠️ Failed to fetch |")
 
-    # Save history
     with open(history_file, "w") as f:
         json.dump(history, f, indent=2)
 
-    # Write GitHub Step Summary if running in GitHub Actions
+    # GitHub Actions Step Summary table
     gh_summary_path = os.getenv("GITHUB_STEP_SUMMARY")
     if gh_summary_path:
         with open(gh_summary_path, "a") as f:
-            f.write("### 🏷️ Price Tracker Run Summary\n\n")
-            f.write(f"*Run completed at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}*\n\n")
-            f.write("| Product | Current Price | Target Threshold | Status |\n")
+            f.write("### 🏷️ Multi-Site Price Tracker Summary\n\n")
+            f.write(f"*Check completed at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}*\n\n")
+            f.write("| Product | Lowest Price Found | Target Threshold | Status |\n")
             f.write("| :--- | :--- | :--- | :--- |\n")
             for row in summary_rows:
                 f.write(f"{row}\n")
