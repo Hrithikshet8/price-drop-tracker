@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-24/7 Automated Multi-Site Price Drop Tracker
-Monitors product prices across different websites, identifies the lowest deal,
-and sends instant alerts when prices drop below the target threshold.
-Runs locally or on GitHub Actions (100% free 24/7).
+24/7 Automated Multi-Site Price Drop Tracker with Playwright Support
+Monitors product prices across different websites using headless Chromium (Playwright)
+and standard HTTP fallback. Compares prices and alerts via Telegram/Discord/Email.
 """
 
 import json
@@ -22,13 +21,85 @@ from typing import Optional, Dict, Any, List
 
 
 USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
 
+def fetch_with_playwright(url: str) -> Optional[int]:
+    """Uses Playwright Chromium to bypass Cloudflare/Akamai and render dynamic JavaScript."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled"
+                ]
+            )
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1366, "height": 768},
+                locale="en-IN",
+                timezone_id="Asia/Kolkata"
+            )
+            page = context.new_page()
+            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+            page.goto(url, wait_until="domcontentloaded", timeout=40000)
+            page.wait_for_timeout(3500)  # Allow React/Next.js hydration
+
+            domain = urllib.parse.urlparse(url).netloc.lower()
+            price = None
+
+            # 1. Amazon
+            if "amazon" in domain:
+                el = page.query_selector(".a-price-whole")
+                if el:
+                    cleaned = re.sub(r"[^\d]", "", el.inner_text())
+                    if cleaned:
+                        price = int(cleaned)
+
+            # 2. Flipkart
+            elif "flipkart" in domain:
+                for sel in [".Nx9bqj", "._30jeq3", "div._25b18c > div", "[class*='price']"]:
+                    el = page.query_selector(sel)
+                    if el:
+                        cleaned = re.sub(r"[^\d]", "", el.inner_text())
+                        if cleaned and int(cleaned) > 500:
+                            price = int(cleaned)
+                            break
+
+            # 3. Wakefit Official
+            elif "wakefit" in domain:
+                for sel in [".special-price", ".selling-price", ".final-price", "[data-price]", "span.price"]:
+                    el = page.query_selector(sel)
+                    if el:
+                        cleaned = re.sub(r"[^\d]", "", el.inner_text())
+                        if cleaned and int(cleaned) > 500:
+                            price = int(cleaned)
+                            break
+
+            # 4. Fallback: Parse rendered HTML
+            if not price:
+                content = page.content()
+                price = extract_price(url, content)
+
+            browser.close()
+            return price
+    except Exception as e:
+        print(f"Playwright fetch error for {url}: {e}", file=sys.stderr)
+        return None
+
+
 def fetch_html(url: str) -> str:
-    """Fetches web page HTML using curl with realistic browser headers."""
+    """Fetches web page HTML using curl with realistic headers."""
     if not url:
         return ""
     cmd = [
@@ -71,7 +142,7 @@ def extract_price(url: str, html: str) -> Optional[int]:
                 if cleaned.isdigit() and int(cleaned) > 500:
                     return int(cleaned)
 
-    # 3. Generic JSON-LD schema price
+    # 3. JSON-LD schema price
     schema_matches = re.findall(r'"price"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?', html)
     if schema_matches:
         for m in schema_matches:
@@ -92,10 +163,9 @@ def extract_price(url: str, html: str) -> Optional[int]:
 
 def send_telegram_alert(bot_token: str, chat_id: str, message: str, plain_text_fallback: str):
     """Sends a Telegram push notification with full error diagnostics and fallback."""
-    print(f"\n[Telegram] Attempting to send alert to Chat ID: {chat_id}...")
+    print(f"\n[Telegram] Delivering alert to Chat ID: {chat_id}...")
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
-    # Try HTML mode first with strict double-quotes
     payload = {
         "chat_id": chat_id,
         "text": message,
@@ -118,7 +188,6 @@ def send_telegram_alert(bot_token: str, chat_id: str, message: str, plain_text_f
         print(f"⚠️ [Telegram] HTML delivery failed ({e.code}): {err_msg}", file=sys.stderr)
         print("[Telegram] Retrying with plain-text fallback...", file=sys.stderr)
 
-        # Retry with plain text to bypass HTML parsing errors
         plain_payload = {
             "chat_id": chat_id,
             "text": plain_text_fallback,
@@ -133,11 +202,8 @@ def send_telegram_alert(bot_token: str, chat_id: str, message: str, plain_text_f
             with urllib.request.urlopen(plain_req, timeout=15) as resp:
                 print("✅ [Telegram] Plain text alert delivered successfully!")
                 return
-        except urllib.error.HTTPError as e2:
-            err2 = e2.read().decode("utf-8", errors="ignore")
-            print(f"❌ [Telegram] Plain text retry failed ({e2.code}): {err2}", file=sys.stderr)
-            if "bot was blocked" in err2 or "chat not found" in err2:
-                print("💡 TIP: Please open your bot in Telegram and press 'Start' so it is allowed to message you!", file=sys.stderr)
+        except Exception as e2:
+            print(f"❌ [Telegram] Retry failed: {e2}", file=sys.stderr)
     except Exception as e:
         print(f"❌ [Telegram] Unexpected error: {e}", file=sys.stderr)
 
@@ -201,18 +267,32 @@ def check_product(item: Dict[str, Any]) -> Dict[str, Any]:
     threshold = item.get("threshold_price", 0)
     currency = item.get("currency", "INR")
 
-    # Support either single 'url' or multiple 'stores'
     stores_list = item.get("stores", [])
     if not stores_list and item.get("url"):
         stores_list = [{"store": "Amazon India", "url": item.get("url")}]
+
+    # Check if Playwright is available in the environment
+    try:
+        import playwright
+        has_playwright = True
+    except ImportError:
+        has_playwright = False
 
     store_results = []
     for s in stores_list:
         s_name = s.get("store", "Store")
         s_url = s.get("url", "")
-        print(f"Fetching from {s_name}...")
-        html = fetch_html(s_url)
-        price = extract_price(s_url, html)
+        price = None
+
+        if has_playwright:
+            print(f"Fetching from {s_name} with Headless Browser...")
+            price = fetch_with_playwright(s_url)
+
+        if not price:
+            print(f"Fetching from {s_name} with HTTP...")
+            html = fetch_html(s_url)
+            price = extract_price(s_url, html)
+
         if price:
             print(f"  -> {s_name}: {currency} {price:,}")
             store_results.append({"store": s_name, "url": s_url, "price": price})
@@ -231,7 +311,7 @@ def check_product(item: Dict[str, Any]) -> Dict[str, Any]:
             "status": "⚠️ Failed to fetch"
         }
 
-    # Find the store with the lowest price
+    # Sort stores by price to find the absolute lowest deal
     store_results.sort(key=lambda x: x["price"])
     best = store_results[0]
     is_below = best["price"] <= threshold
@@ -260,7 +340,6 @@ def main():
     with open(products_file, "r") as f:
         products = json.load(f)
 
-    # Check secrets availability
     tg_token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     tg_chat_id = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
     discord_webhook = (os.getenv("DISCORD_WEBHOOK_URL") or "").strip()
@@ -306,14 +385,12 @@ def main():
                 savings = threshold - lowest
                 savings_str = f" (Savings: {currency} {savings:,})" if savings > 0 else ""
 
-                # Cross-site comparison summary
                 comparison_lines = []
                 for s in res["all_stores"]:
                     marker = "🏆 " if s["store"] == lowest_store else "   "
                     comparison_lines.append(f"{marker}• {s['store']}: {currency} {s['price']:,}")
                 comparison_text = "\n".join(comparison_lines)
 
-                # HTML message for Telegram
                 tg_html_msg = (
                     f"🚨 <b>PRICE DROP ALERT!</b>\n\n"
                     f"<b>{name}</b> is now at the lowest price!\n\n"
@@ -324,7 +401,6 @@ def main():
                     f"👉 <a href=\"{lowest_url}\">Click Here to Buy on {lowest_store}</a>"
                 )
 
-                # Plain text message fallback
                 tg_plain_msg = (
                     f"🚨 PRICE DROP ALERT!\n\n"
                     f"{name} is now at the lowest price!\n\n"
@@ -337,21 +413,15 @@ def main():
 
                 print(">>> ALERT CONDITION MET! Dispatching notifications...")
 
-                # 1. Telegram
                 if tg_token and tg_chat_id:
                     send_telegram_alert(tg_token, tg_chat_id, tg_html_msg, tg_plain_msg)
-                else:
-                    print("⚠️ Telegram alert skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing.")
 
-                # 2. Discord
                 if discord_webhook:
                     send_discord_alert(discord_webhook, f"Price Drop: {name}", tg_plain_msg, lowest_url)
 
-                # 3. Email
                 if email_user and email_pass and email_to:
                     send_email_alert(email_user, email_pass, email_to, f"Price Drop: {name}", tg_plain_msg)
 
-                # 4. macOS Notification (if local)
                 if sys.platform == "darwin":
                     msg = f"Lowest: {currency} {lowest:,} on {lowest_store}!"
                     subprocess.run([
@@ -359,7 +429,6 @@ def main():
                         f'display notification "{msg}" with title "Price Drop Alert" sound name "Glass"'
                     ], check=False)
 
-            # Update history record
             history[name] = {
                 "lowest_price": lowest,
                 "lowest_store": lowest_store,
@@ -374,7 +443,6 @@ def main():
     with open(history_file, "w") as f:
         json.dump(history, f, indent=2)
 
-    # GitHub Actions Step Summary table
     gh_summary_path = os.getenv("GITHUB_STEP_SUMMARY")
     if gh_summary_path:
         with open(gh_summary_path, "a") as f:
